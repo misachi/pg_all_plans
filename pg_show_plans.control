@@ -1,0 +1,5 @@
+# pg_show_plans extension
+comment = 'Show all top plans considered by the optimizer'
+default_version = '1.0'
+module_pathname = '$libdir/pg_show_plans'
+relocatable = true
