@@ -33,9 +33,6 @@ PG_MODULE_MAGIC;
 
 static MemoryContext ShowAllPlanContext = NULL;
 
-static List *new_planner(
-    Query *parse, const char *query_string,
-    int cursorOptions, ParamListInfo boundParams);
 static void explain_query(Query *query, int cursorOptions,
                           IntoClause *into, ExplainState *es,
                           const char *queryString, ParamListInfo params,
@@ -45,77 +42,6 @@ static PlannedStmt *get_planned_stmt(
     Path *path, double tuple_fraction, int cursorOptions);
 
 Datum show_all_plans(PG_FUNCTION_ARGS);
-
-/* planner function updated to include all paths included in final RelOptInfo.
- * `new_planner` and `get_planned_stmt` are simply the `standard_planner`
- * with minor tweak to generate plans for all paths included in an UPPERREL_FINAL
- * RelOptInfo
- */
-static List *new_planner(
-    Query *parse, const char *query_string,
-    int cursorOptions, ParamListInfo boundParams)
-{
-    PlannerGlobal *glob;
-    double tuple_fraction;
-    PlannerInfo *root;
-    ListCell *l;
-    List *all_plans = NIL;
-    RelOptInfo *final_rel;
-
-    glob = makeNode(PlannerGlobal);
-
-    glob->boundParams = boundParams;
-
-    if ((cursorOptions & CURSOR_OPT_PARALLEL_OK) != 0 &&
-        IsUnderPostmaster &&
-        parse->commandType == CMD_SELECT &&
-        !parse->hasModifyingCTE &&
-        max_parallel_workers_per_gather > 0 &&
-        !IsParallelWorker())
-    {
-        /* all the cheap tests pass, so scan the query tree */
-        glob->maxParallelHazard = max_parallel_hazard(parse);
-        glob->parallelModeOK = (glob->maxParallelHazard != PROPARALLEL_UNSAFE);
-    }
-    else
-    {
-        /* skip the query tree scan, just assume it's unsafe */
-        glob->maxParallelHazard = PROPARALLEL_UNSAFE;
-        glob->parallelModeOK = false;
-    }
-
-    glob->parallelModeNeeded = glob->parallelModeOK &&
-                               (debug_parallel_query != DEBUG_PARALLEL_OFF);
-
-    /* Determine what fraction of the plan is likely to be scanned */
-    if (cursorOptions & CURSOR_OPT_FAST_PLAN)
-    {
-        tuple_fraction = cursor_tuple_fraction;
-
-        if (tuple_fraction >= 1.0)
-            tuple_fraction = 0.0;
-        else if (tuple_fraction <= 0.0)
-            tuple_fraction = 1e-10;
-    }
-    else
-    {
-        /* Default assumption is we need all the tuples */
-        tuple_fraction = 0.0;
-    }
-
-    /* primary planning entry point (may recurse for subqueries) */
-    root = subquery_planner(glob, parse, NULL,
-                            false, tuple_fraction);
-    /* Select best Path and turn it into a Plan */
-    final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
-    foreach (l, final_rel->pathlist)
-    {
-        Path *path = (Path *)lfirst(l);
-        all_plans = lappend(all_plans,
-                            get_planned_stmt(root, glob, parse, path, tuple_fraction, cursorOptions));
-    }
-    return all_plans;
-}
 
 static PlannedStmt *get_planned_stmt(
     PlannerInfo *root, PlannerGlobal *glob, Query *parse,
@@ -264,33 +190,90 @@ static void explain_query(Query *query, int cursorOptions,
                           QueryEnvironment *queryEnv)
 {
     instr_time planstart,
-        planduration;
+        planduration, temp_duration;
     BufferUsage bufusage_start,
         bufusage;
-    List *all_plans = NIL;
     ListCell *l;
     int k = 1;
+    PlannerGlobal *glob;
+    double tuple_fraction;
+    PlannerInfo *root;
+    RelOptInfo *final_rel;
 
     if (es->buffers)
         bufusage_start = pgBufferUsage;
     INSTR_TIME_SET_CURRENT(planstart);
 
     /* plan the query */
-    all_plans = new_planner(query, queryString, cursorOptions, params);
+    glob = makeNode(PlannerGlobal);
 
-    foreach (l, all_plans)
+    glob->boundParams = params;
+
+    if ((cursorOptions & CURSOR_OPT_PARALLEL_OK) != 0 &&
+        IsUnderPostmaster &&
+        query->commandType == CMD_SELECT &&
+        !query->hasModifyingCTE &&
+        max_parallel_workers_per_gather > 0 &&
+        !IsParallelWorker())
     {
-        PlannedStmt *plan = (PlannedStmt *)lfirst(l);
-        appendStringInfo(es->str, "-------------------------------Plan %d-------------------------------\n", k++);
+        /* all the cheap tests pass, so scan the query tree */
+        glob->maxParallelHazard = max_parallel_hazard(query);
+        glob->parallelModeOK = (glob->maxParallelHazard != PROPARALLEL_UNSAFE);
+    }
+    else
+    {
+        /* skip the query tree scan, just assume it's unsafe */
+        glob->maxParallelHazard = PROPARALLEL_UNSAFE;
+        glob->parallelModeOK = false;
+    }
+
+    glob->parallelModeNeeded = glob->parallelModeOK &&
+                               (debug_parallel_query != DEBUG_PARALLEL_OFF);
+
+    /* Determine what fraction of the plan is likely to be scanned */
+    if (cursorOptions & CURSOR_OPT_FAST_PLAN)
+    {
+        tuple_fraction = cursor_tuple_fraction;
+
+        if (tuple_fraction >= 1.0)
+            tuple_fraction = 0.0;
+        else if (tuple_fraction <= 0.0)
+            tuple_fraction = 1e-10;
+    }
+    else
+    {
+        /* Default assumption is we need all the tuples */
+        tuple_fraction = 0.0;
+    }
+
+    /* primary planning entry point (may recurse for subqueries) */
+    root = subquery_planner(glob, query, NULL,
+                            false, tuple_fraction);
+    /* Select best Path and turn it into a Plan */
+    final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
+
+    INSTR_TIME_SET_CURRENT(temp_duration);
+    INSTR_TIME_SUBTRACT(temp_duration, planstart);
+
+    foreach (l, final_rel->pathlist)
+    {
+        Path *path = (Path *)lfirst(l);
+        PlannedStmt *plan;
+
+        INSTR_TIME_SET_CURRENT(planstart);
+        plan = get_planned_stmt(root, glob, query, path, tuple_fraction, cursorOptions);
 
         INSTR_TIME_SET_CURRENT(planduration);
         INSTR_TIME_SUBTRACT(planduration, planstart);
+        INSTR_TIME_ADD(planduration, temp_duration);
 
         if (es->buffers)
         {
             memset(&bufusage, 0, sizeof(BufferUsage));
             BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
         }
+
+        appendStringInfo(es->str, "-------------------------------Plan %d-------------------------------\n", k++);
 
         ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
                        &planduration, (es->buffers ? &bufusage : NULL));
