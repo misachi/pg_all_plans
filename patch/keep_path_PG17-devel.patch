@@ -1,0 +1,100 @@
+diff --git a/src/backend/optimizer/util/pathnode.c b/src/backend/optimizer/util/pathnode.c
+index 211ba65389..3cac0804a2 100644
+--- a/src/backend/optimizer/util/pathnode.c
++++ b/src/backend/optimizer/util/pathnode.c
+@@ -579,26 +579,9 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+                        }
+                }
+
+-               /*
+-                * Remove current element from pathlist if dominated by new.
+-                */
+-               if (remove_old)
+-               {
+-                       parent_rel->pathlist = foreach_delete_current(parent_rel->pathlist,
+-                                                                                                                 p1);
+-
+-                       /*
+-                        * Delete the data pointed-to by the deleted cell, if possible
+-                        */
+-                       if (!IsA(old_path, IndexPath))
+-                               pfree(old_path);
+-               }
+-               else
+-               {
+-                       /* new belongs after this old path if it has cost >= old's */
+-                       if (new_path->total_cost >= old_path->total_cost)
+-                               insert_at = foreach_current_index(p1) + 1;
+-               }
++               /* Get location for new path if it has cost >= old */
++               if (new_path->total_cost >= old_path->total_cost)
++                       insert_at = foreach_current_index(p1) + 1;
+
+                /*
+                 * If we found an old path that dominates new_path, we can quit
+@@ -609,18 +592,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
+                        break;
+        }
+
+-       if (accept_new)
+-       {
+-               /* Accept the new path: insert it at proper place in pathlist */
+-               parent_rel->pathlist =
+-                       list_insert_nth(parent_rel->pathlist, insert_at, new_path);
+-       }
+-       else
+-       {
+-               /* Reject and recycle the new path */
+-               if (!IsA(new_path, IndexPath))
+-                       pfree(new_path);
+-       }
++       /* Always accept the new path */
++       parent_rel->pathlist = list_insert_nth(parent_rel->pathlist, insert_at, new_path);
+ }
+
+ /*
+@@ -815,21 +788,9 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+                        }
+                }
+
+-               /*
+-                * Remove current element from partial_pathlist if dominated by new.
+-                */
+-               if (remove_old)
+-               {
+-                       parent_rel->partial_pathlist =
+-                               foreach_delete_current(parent_rel->partial_pathlist, p1);
+-                       pfree(old_path);
+-               }
+-               else
+-               {
+-                       /* new belongs after this old path if it has cost >= old's */
+-                       if (new_path->total_cost >= old_path->total_cost)
+-                               insert_at = foreach_current_index(p1) + 1;
+-               }
++               /* Get location for new path if it has cost >= old */
++               if (new_path->total_cost >= old_path->total_cost)
++                       insert_at = foreach_current_index(p1) + 1;
+
+                /*
+                 * If we found an old path that dominates new_path, we can quit
+@@ -840,17 +801,8 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+                        break;
+        }
+
+-       if (accept_new)
+-       {
+-               /* Accept the new path: insert it at proper place */
+-               parent_rel->partial_pathlist =
+-                       list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
+-       }
+-       else
+-       {
+-               /* Reject and recycle the new path */
+-               pfree(new_path);
+-       }
++       /* Always accept the new path */
++       parent_rel->partial_pathlist = list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
+ }
+
+ /*
