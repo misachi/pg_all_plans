@@ -62,3 +62,125 @@ postgres=# SELECT * FROM show_all_plans('EXPLAIN (ANALYZE, BUFFERS) SELECT * FRO
 
 (9 rows)
 ```
+
+Storing multiple plans requires more memory resources. The optimizer opts to delete and release memory of paths when it deems such paths would never be chosen if there are other cheaper plans. In such cases, the `pg_show_plans` extension would not be able to show such plans.
+
+In order to preserve such plans, so they than can be shown by the extension, there are patch files in the `patch` directory. This contains minimal changes to the codebase to prevent deletion of paths even if there are cheaper paths being considered. You get to see more plans as shown below
+
+```
+postgres=# CREATE TABLE foo(id1 INT, id2 INT, id3 INT, id4 INT, descr TEXT);  -- new table
+postgres=# INSERT INTO foo SELECT i, i*3, i+i, i*2, 'hello' || i FROM generate_series(1, 10000000) i; -- 10M records
+postgres=# CREATE INDEX idx_id1_id2_id3 ON foo(id1, id2, id3);
+
+
+postgres=# SELECT * FROM show_all_plans('EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM foo WHERE id1 > 1000');
+                                                                  query_plans
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ -------------------------------Plan 1-------------------------------
+ Seq Scan on foo  (cost=0.00..198530.00 rows=9999027 width=28) (actual time=0.250..2603.390 rows=9999000 loops=1)
+   Filter: (id1 > 1000)
+   Rows Removed by Filter: 1000
+   Buffers: shared hit=16182 read=57348
+ Planning:
+   Buffers: shared hit=47 read=4 dirtied=3
+ Planning Time: 0.939 ms
+ Execution Time: 3263.912 ms
+
+ -------------------------------Plan 2-------------------------------
+ Index Scan using idx_id1_id2_id3 on foo  (cost=0.43..498815.28 rows=9999027 width=28) (actual time=0.444..3309.395 rows=9999000 loops=1)
+   Index Cond: (id1 > 1000)
+   Buffers: shared hit=2 read=111835 written=8120
+ Planning:
+   Buffers: shared hit=16229 read=57352 dirtied=3
+ Planning Time: 0.947 ms
+ Execution Time: 3981.410 ms
+
+ -------------------------------Plan 3-------------------------------
+ Bitmap Heap Scan on foo  (cost=231288.89..429813.47 rows=9999027 width=28) (actual time=1319.351..3678.529 rows=9999000 loops=1)
+   Recheck Cond: (id1 > 1000)
+   Rows Removed by Index Recheck: 35
+   Heap Blocks: exact=40497 lossy=33026
+   Buffers: shared read=111837
+   ->  Bitmap Index Scan on idx_id1_id2_id3  (cost=0.00..228789.14 rows=9999027 width=0) (actual time=1301.783..1301.783 rows=9999000 loops=1)
+         Index Cond: (id1 > 1000)
+         Buffers: shared read=38314
+ Planning:
+   Buffers: shared hit=16231 read=169190 dirtied=3 written=8120
+ Planning Time: 0.951 ms
+ Execution Time: 4338.259 ms
+
+ -------------------------------Plan 4-------------------------------
+ Gather  (cost=1000.00..1126516.03 rows=9999027 width=28) (actual time=0.524..1658.062 rows=9999000 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=16228 read=57302
+   ->  Parallel Seq Scan on foo  (cost=0.00..125613.33 rows=4166261 width=28) (actual time=0.118..917.219 rows=3333000 loops=3)
+         Filter: (id1 > 1000)
+         Rows Removed by Filter: 333
+         Buffers: shared hit=16228 read=57302
+ Planning:
+   Buffers: shared hit=16231 read=281027 dirtied=3 written=8120
+ Planning Time: 0.952 ms
+ Execution Time: 2434.354 ms
+
+(47 rows)
+```
+
+Four plans were considered, plain sequential scan plan wins(the cheapest) and is selected by the optimizer. One reason why sequential scan is chosen is due to potentially low number of blocks that would be read from disk. An index scan may require reading blocks in the index table(if not in buffer) then reading data from the heap(if data required is not in the index). Also, a large number of tuples would be returned by the query as we are filtering only 1000 records out of 10M. Indexes don't work well when a large set of data is required.
+When we limit the query to a smaller subset of the data, the optimizer rightfully picks an index plan. See below:
+
+```
+postgres=# SELECT * FROM show_all_plans('EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM foo WHERE id1 > 1000 AND id1 < 1500000');
+                                                                query_plans
+--------------------------------------------------------------------------------------------------------------------------------------------
+ -------------------------------Plan 1-------------------------------
+ Index Scan using idx_id1_id2_id3 on foo  (cost=0.43..187892.55 rows=1498365 width=28) (actual time=0.023..548.997 rows=1498999 loops=1)
+   Index Cond: ((id1 > 1000) AND (id1 < 1500000))
+   Buffers: shared hit=2 read=16768
+ Planning:
+   Buffers: shared read=4
+ Planning Time: 0.170 ms
+ Execution Time: 651.542 ms
+
+ -------------------------------Plan 2-------------------------------
+ Seq Scan on foo  (cost=0.00..223530.00 rows=1498365 width=28) (actual time=0.204..2333.970 rows=1498999 loops=1)
+   Filter: ((id1 > 1000) AND (id1 < 1500000))
+   Rows Removed by Filter: 8501001
+   Buffers: shared hit=10696 read=62834
+ Planning:
+   Buffers: shared hit=2 read=16772
+ Planning Time: 0.174 ms
+ Execution Time: 2432.406 ms
+
+ -------------------------------Plan 3-------------------------------
+ Bitmap Heap Scan on foo  (cost=38406.68..205106.49 rows=1498365 width=28) (actual time=236.667..539.696 rows=1498999 loops=1)
+   Recheck Cond: ((id1 > 1000) AND (id1 < 1500000))
+   Heap Blocks: exact=11023
+   Buffers: shared hit=171 read=16599
+   ->  Bitmap Index Scan on idx_id1_id2_id3  (cost=0.00..38032.08 rows=1498365 width=0) (actual time=233.444..233.445 rows=1498999 loops=1)
+         Index Cond: ((id1 > 1000) AND (id1 < 1500000))
+         Buffers: shared hit=171 read=5576
+ Planning:
+   Buffers: shared hit=10698 read=79606
+ Planning Time: 0.182 ms
+ Execution Time: 638.010 ms
+
+ -------------------------------Plan 4-------------------------------
+ Gather  (cost=1000.00..286866.50 rows=1498365 width=28) (actual time=0.518..2226.432 rows=1498999 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=11023 read=62507
+   ->  Parallel Seq Scan on foo  (cost=0.00..136030.00 rows=624319 width=28) (actual time=0.093..805.573 rows=499666 loops=3)
+         Filter: ((id1 > 1000) AND (id1 < 1500000))
+         Rows Removed by Filter: 2833667
+         Buffers: shared hit=11023 read=62507
+ Planning:
+   Buffers: shared hit=10869 read=96205
+ Planning Time: 0.182 ms
+ Execution Time: 2349.584 ms
+
+(46 rows)
+```
+
+One interesting bit is the bitmap heap index scan plan has a substantially high startup time, hence falls behind the sequential scan even though the total cost of bitmap index plan is lower than that of sequential scan.
+Ideally `pg_show_plans` should not be used in a production enviroment. It can be useful in situations where the optimizer picks a known less optimal plan then you can create a test environment and debug the query to find out why a sub-optimal plan was selected.
