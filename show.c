@@ -247,8 +247,13 @@ static void explain_query(Query *query, int cursorOptions,
     }
 
     /* primary planning entry point (may recurse for subqueries) */
+#if PG_MAJORVERSION_NUM <= 17 && PG_MINORVERSION_NUM < 4
     root = subquery_planner(glob, query, NULL,
                             false, tuple_fraction);
+#else
+    root = subquery_planner(glob, query, NULL,
+                            false, tuple_fraction, NULL);
+#endif
     /* Select best Path and turn it into a Plan */
     final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
 
@@ -275,8 +280,13 @@ static void explain_query(Query *query, int cursorOptions,
 
         appendStringInfo(es->str, "-------------------------------Plan %d-------------------------------\n", k++);
 
+#if PG_MAJORVERSION_NUM <= 17 && PG_MINORVERSION_NUM < 4
         ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
                        &planduration, (es->buffers ? &bufusage : NULL));
+#else
+        ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
+                       &planduration, (es->buffers ? &bufusage : NULL), NULL);
+#endif
         ExplainSeparatePlans(es);
     }
 }
